@@ -4,6 +4,7 @@
 注册 AirPlay 音频服务，让 iOS 将本设备识别为音频接收器。
 """
 
+import ipaddress
 import logging
 import socket
 import threading
@@ -15,6 +16,31 @@ from zeroconf._exceptions import ServiceNameAlreadyRegistered, NonUniqueNameExce
 from miair.config import Config
 
 log = logging.getLogger("miair")
+
+
+def create_zeroconf(ip: str = "") -> Zeroconf:
+    """[本地补丁] 创建 Zeroconf 实例：只走 IPv4，并尽量限定在配置的那张网卡上。
+
+    - 强制 IPVersion.V4Only：Windows 上 IPVersion.All 会额外建立 ('::', 5353) 的 IPv6
+      socket；本机没有可用 IPv6 路由时会持续抛 WinError 1232「不能访问网络位置」刷屏。
+      MiAir 只广播 IPv4 地址（socket.inet_aton），IPv6 那套没有用处。
+    - 若 ip 确实是本机某张网卡的地址，则把 mDNS 限定在该网卡，避免在 Tailscale、
+      断开的 WLAN / Wi-Fi Direct 等接口上做无效广播（这些正是 1232 的来源）。
+    """
+    interfaces: list[str] | None = None
+    if ip:
+        try:
+            ipaddress.ip_address(ip)
+            local_ips = {addr for addr, _ in Config._collect_local_ipv4_candidates()}
+            if ip in local_ips:
+                interfaces = [ip]
+        except ValueError:
+            interfaces = None
+    # 注意：zeroconf 0.151 的 normalize_interface_choice 不接受显式 interfaces=None
+    # （会抛 TypeError: choice must be a list or InterfaceChoice），未 pin 时必须省略该参数。
+    if interfaces is not None:
+        return Zeroconf(interfaces=interfaces, ip_version=IPVersion.V4Only)
+    return Zeroconf(ip_version=IPVersion.V4Only)
 
 
 class AirPlayMDNS:
@@ -53,7 +79,7 @@ class AirPlayMDNS:
                 self.zeroconf = self.shared_zeroconf
                 log.info("使用共享 Zeroconf 实例")
             else:
-                self.zeroconf = Zeroconf(ip_version=IPVersion.All)
+                self.zeroconf = create_zeroconf(ip)
                 log.info("创建新的 Zeroconf 实例")
 
             # 构建设备 ID (去掉冒号的 MAC 地址格式，用于 RAOP 服务名)

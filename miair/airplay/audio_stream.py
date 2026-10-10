@@ -8,6 +8,7 @@
 
 import asyncio
 import logging
+import os
 import queue
 import struct
 import subprocess
@@ -16,12 +17,38 @@ import time
 
 from aiohttp import web
 
+from miair import _timing
+
 log = logging.getLogger("miair")
+
+# --- [本地补丁] 起播延迟优化：虚报 WAV 头的 byte_rate（默认已启用）---
+# 小爱音箱用 data÷byte_rate 推算"这路流有多长"来决定起播缓冲深度，而真正解码只用
+# sample_rate/位宽/声道 —— 所以把 byte_rate 虚报得很大（让音箱以为流很短），就能几乎
+# 不做起播缓冲；data_size 仍声明 0x7FFFFF00，因此永不截断、播放速度也不受影响。
+# 实测（用户实听）：起播从 4s 降到约 1s，无断续、无忽快忽慢，音箱也不掉线重连。
+#   MIAIR_STREAM_MODE=wav_br（默认）虚报 byte_rate
+#   MIAIR_STREAM_MODE=wav          原始行为（逃生口：固件升级后若失效可用它退回）
+# MIAIR_WAV_SECONDS：默认 30 —— 让音箱"以为"这路流有 30 秒。数值越小起播越快、缓冲越薄；
+# 出现断续/爆音就调大（如 60/120），想更快可调小（如 1）。
+# 注：曾实验过 wav_small（缩短 data → 起播快但硬截断）、wav_riff（缩小 riff_size →
+# 破坏播放时序、声音突然加速）、l16（裸 PCM → LX06 不认、无声），均已删除代码。
+# 注：曾想"去掉 Transfer-Encoding: chunked、改用 Connection: close 定界"，但实测
+# aiohttp 3.14 对无长度的 HTTP/1.1 流强制分块（连私有 _chunked=False 都无效），未做。
+_STREAM_MODE = os.environ.get("MIAIR_STREAM_MODE", "wav_br").strip().lower()
+_WAV_SECONDS = int(os.environ.get("MIAIR_WAV_SECONDS", "30") or 30)
 
 # --- 队列参数 ---
 # 每个 ALAC 包约 8ms (352 samples @ 44100Hz)
-# 100 个包 ≈ 800ms 的缓冲上限，兼顾低延迟与抗 WiFi 抖动
-_QUEUE_MAXSIZE = 100
+# [本地补丁] 原值 100（≈800ms）会在"MiAir 已开始产出 PCM，但音箱还没来拉流"的窗口里
+# 被填满，进而触发 write_pcm 的丢弃策略（丢最旧的 25%），把每首歌开头的约 200ms 削掉。
+# 实测该窗口可达 828ms（命令下发 → 小米云往返 781ms → 音箱才开始拉流），且音箱慢时会更长，
+# 因此提高到 400（≈3.2s）以完整覆盖这段等待。内存代价约 400 × 1.4KB ≈ 560KB。
+# 注意：这不增加起播延迟——积压量由等待时长决定，与上限无关；上限只决定何时开始丢。
+_QUEUE_MAXSIZE = 400
+
+# [本地补丁] 队列溢出时一次丢弃的包数（固定值，不再按上限比例放大）。
+# 25 包 ≈ 200ms：足够腾出空间，又不会像"上限 // 4"那样一次丢掉 800ms 造成明显停顿。
+_DROP_PACKETS = 25
 
 
 class AudioStreamServer:
@@ -49,6 +76,7 @@ class AudioStreamServer:
         self._session_id = int(time.time())
         self._has_clients = False
         self._client_lock = threading.Lock()
+        self._drop_events = 0  # [本地补丁] 卡顿诊断：队列溢出丢弃的累计次数
 
         self._setup_routes()
 
@@ -112,17 +140,17 @@ class AudioStreamServer:
         log.info("音频流: 停止接收 PCM 数据")
 
     def write_pcm(self, data: bytes):
-        """写入 PCM 音频数据 — 非阻塞，队列满时批量丢弃旧数据腾出空间"""
+        """写入 PCM 音频数据 — 非阻塞，队列满时丢弃一小批旧数据腾出空间"""
         if not self._active:
             return
         try:
             self._audio_queue.put_nowait(data)
         except queue.Full:
-            # 批量丢弃旧数据，一次性腾出足够空间，避免反复 put/get 开销
+            # [本地补丁] 丢弃量固定为 _DROP_PACKETS。原实现用 _QUEUE_MAXSIZE // 4，
+            # 上限从 100 提到 400 后单次丢弃会从 200ms 变成 800ms（明显停顿）。
             dropped = 0
-            target = _QUEUE_MAXSIZE // 4  # 丢弃 25% 腾出充裕空间
             try:
-                for _ in range(target):
+                for _ in range(_DROP_PACKETS):
                     self._audio_queue.get_nowait()
                     dropped += 1
             except queue.Empty:
@@ -131,6 +159,13 @@ class AudioStreamServer:
                 self._audio_queue.put_nowait(data)
             except queue.Full:
                 pass
+            # [本地补丁] 卡顿诊断：溢出丢弃原本完全静默、日志里查不到，这里留痕
+            if dropped:
+                self._drop_events += 1
+                log.warning(
+                    f"[卡顿诊断] PCM 队列溢出，丢弃 {dropped} 包"
+                    f"（≈{dropped * 8}ms），本会话累计 {self._drop_events} 次"
+                )
 
     # ============================================================
     # WAV 模式 — 直接输出 PCM，零编码延迟
@@ -145,10 +180,22 @@ class AudioStreamServer:
             return web.Response(status=404, headers={"Connection": "close"})
         return None
 
-    def _build_wav_header(self, data_size: int = 0x7FFFFF00) -> bytes:
-        byte_rate = self._sample_rate * self._channels * self._sample_width
+    def _build_wav_header(
+        self,
+        data_size: int = 0x7FFFFF00,
+        byte_rate: int | None = None,
+    ) -> bytes:
+        """构造 44 字节 WAV 头。
+
+        [本地补丁] 只把 byte_rate 做成可单独虚报（见文件头说明）。byte_rate=None 时
+        与原实现逐字节一致。riff_size 仍写 data_size + 36——实测改小它会让音箱的
+        播放时序错乱（声音突然加速），所以不开放该参数。
+        """
+        real_byte_rate = self._sample_rate * self._channels * self._sample_width
         block_align = self._channels * self._sample_width
         bits_per_sample = self._sample_width * 8
+        if byte_rate is None:
+            byte_rate = real_byte_rate
         return struct.pack(
             '<4sI4s4sIHHIIHH4sI',
             b'RIFF', data_size + 36, b'WAVE',
@@ -167,6 +214,7 @@ class AudioStreamServer:
         if rejected is not None:
             return rejected
 
+        stream_mode = _STREAM_MODE
         response = web.StreamResponse(
             status=200,
             headers={
@@ -191,7 +239,8 @@ class AudioStreamServer:
             self._has_clients = True
         self._abort = False  # 重置中断标志，允许续播
 
-        log.info("AirPlay: 音箱开始拉取 WAV 音频流 (零编码延迟)")
+        _timing.mark("音箱开始拉取 WAV 流（音箱已响应云端命令）")
+        log.info(f"AirPlay: 音箱开始拉取音频流 (零编码延迟) [流模式={stream_mode}]")
 
         # 使用 asyncio.Event 在写入线程和事件循环间通信
         loop = asyncio.get_event_loop()
@@ -242,9 +291,18 @@ class AudioStreamServer:
         reader = threading.Thread(target=_reader_thread, daemon=True)
         reader.start()
 
+        first_pcm_sent = False
         try:
-            # 发送 WAV 头
-            await response.write(self._build_wav_header())
+            # [本地补丁] 默认虚报 byte_rate：让音箱以为这路流很短（几乎不做起播缓冲），
+            # 而 data_size 保持巨大以保证永不截断。stream_mode="wav" 时用原始值。
+            data_size = 0x7FFFFF00
+            byte_rate = None
+            if stream_mode == "wav_br":
+                byte_rate = max(1, data_size // max(1, _WAV_SECONDS))
+            await response.write(
+                self._build_wav_header(data_size, byte_rate=byte_rate)
+            )
+            _timing.mark("WAV 头已写出")
 
             while not writer_done:
                 await data_ready.wait()
@@ -255,6 +313,13 @@ class AudioStreamServer:
                 if chunks:
                     # 批量写入：合并所有 chunk 一次性写出
                     await response.write(b"".join(chunks))
+                    if not first_pcm_sent:
+                        first_pcm_sent = True
+                        _timing.mark("首批 PCM 已送出（MiAir 侧到此为止）")
+                        _timing.note(
+                            "现在开始由音箱自行攒缓冲：若你听到声音明显晚于此刻，"
+                            "延迟就在音箱侧，MiAir 无法再优化"
+                        )
         except (ConnectionResetError, BrokenPipeError):
             log.info("AirPlay: 音箱断开 WAV 音频流连接")
         except Exception as e:

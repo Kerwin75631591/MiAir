@@ -8,8 +8,10 @@ import asyncio
 import logging
 import time
 
-from zeroconf import Zeroconf, IPVersion
+from zeroconf import Zeroconf
 
+from miair import _timing
+from miair.airplay.mdns import create_zeroconf
 from miair.airplay.server import AirPlayServer
 from miair.speaker import SpeakerController
 
@@ -79,6 +81,7 @@ class SpeakerAirPlay:
         注意: 这个回调从 RTSP 线程调用，不在 asyncio 事件循环中。
         必须使用 run_coroutine_threadsafe 安全调度异步任务。
         """
+        _timing.mark("命令音箱播放（交给小米云）")
         log.info(f"AirPlay 音频推送到 {self.device_name}: {stream_url}")
         if self._loop and self._loop.is_running():
             asyncio.run_coroutine_threadsafe(self._play_on_speaker(stream_url), self._loop)
@@ -87,12 +90,16 @@ class SpeakerAirPlay:
 
     async def _play_on_speaker(self, stream_url: str):
         """在对应音箱上播放"""
+        # [本地补丁] 与 _on_play_start 里的"命令音箱播放"打点配合，用来区分
+        # "事件循环调度延迟" 与 "真实云端调用耗时"（实测云端往返仅约 70-120ms）
+        _timing.mark("播放协程开始执行（事件循环调度到位）")
         try:
             self._stream_url = stream_url
             self._airplay_active = True
             self._play_grace_until = time.time() + 10.0  # 10秒宽限期
             success = await self.controller.play_url(stream_url)
             if success:
+                _timing.mark("小米云 play_url 返回成功")
                 log.info(f"AirPlay 音频已在 {self.device_name} 开始播放: {stream_url}")
                 self._start_poll()
                 if self.config:
@@ -274,7 +281,7 @@ class AirPlayManager:
         """为所有音箱启动 AirPlay 服务"""
         # 创建一个共享的 Zeroconf 实例
         if not self._shared_zeroconf:
-            self._shared_zeroconf = Zeroconf(ip_version=IPVersion.All)
+            self._shared_zeroconf = create_zeroconf(self.hostname)
             log.info("创建共享 Zeroconf 实例用于所有音箱")
 
         for did, controller in controllers.items():

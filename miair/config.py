@@ -115,8 +115,12 @@ class Config:
         env_hostname = os.getenv("MIAIR_HOSTNAME", "").strip()
         if env_hostname:
             self.hostname = env_hostname
-        if not self.hostname:
+            self._hostname_source = "explicit"
+        else:
+            # [本地补丁] 不再沿用 config.json 里可能已过期的 hostname，每次启动重新探测。
+            # 需要固定 IP 请用 MIAIR_HOSTNAME 环境变量或 --hostname 命令行参数。
             self.hostname = self._detect_local_ip()
+            self._hostname_source = "auto"
 
     @staticmethod
     def _detect_local_ip() -> str:
@@ -205,7 +209,14 @@ class Config:
         adapter = "ipconfig"
         for raw_line in proc.stdout.splitlines():
             line = raw_line.strip()
-            if line.endswith(":") and not re.search(r"\d+\.\d+\.\d+\.\d+", line):
+            # [本地补丁] ipconfig 的属性行形如 "Connection-specific DNS Suffix  . :"（值为空时
+            # 以 ":" 结尾且不含 IP），原先会被误判成网卡名，使虚拟网卡（Tailscale/WSL 等）
+            # 的 -120 降权规则失效。属性行必含 " . . " 特征，据此排除。
+            if (
+                line.endswith(":")
+                and " . " not in line
+                and not re.search(r"\d+\.\d+\.\d+\.\d+", line)
+            ):
                 adapter = line[:-1]
             if "ipv4" not in line.lower():
                 continue
@@ -329,6 +340,9 @@ class Config:
         with self._save_lock:
             os.makedirs(self.conf_path, exist_ok=True)
             data = asdict(self)
+            # [本地补丁] 自动探测得到的 IP 不回写文件，避免下次启动用到过期地址
+            if getattr(self, "_hostname_source", "auto") == "auto":
+                data["hostname"] = ""
             # speakers 中的 Speaker 对象转为 dict
             speakers_data = {}
             for did, speaker in data.get("speakers", {}).items():

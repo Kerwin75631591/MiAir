@@ -22,6 +22,7 @@ from typing import Callable
 import av
 from Crypto.Cipher import AES
 
+from miair import _timing
 from miair.airplay.audio_stream import AudioStreamServer
 from miair.airplay.mdns import AirPlayMDNS
 from miair.airplay.playfair import PlayFair
@@ -142,6 +143,10 @@ class PlaybackPacer:
         self._startup_count: int = 0
         self._startup_target: int = 32  # ~256ms
         self._started: bool = False
+        # [本地补丁] 卡顿修复用：重锚点限速、重锚次数、上次 D4 锚点更新时间
+        self._last_reanchor_perf: float = 0.0
+        self._reanchor_count: int = 0
+        self._last_anchor_update_perf: float = 0.0
 
     @property
     def has_anchor(self) -> bool:
@@ -158,6 +163,7 @@ class PlaybackPacer:
         """
         now_perf = time.perf_counter()
         with self._lock:
+            self._last_anchor_update_perf = now_perf
             if self._anchor_rtp_ts is None:
                 # 首次同步: 建立锚点
                 self._anchor_rtp_ts = play_at_rtp_ts
@@ -176,9 +182,28 @@ class PlaybackPacer:
                     self._anchor_rtp_ts = play_at_rtp_ts
                     self._anchor_perf = now_perf + self._target_latency_sec
 
+    # [本地补丁] 卡顿修复：迟到不再丢帧，改为"重设锚点 + 照常播出"。
+    # 原实现是 `elif wait_time < -0.100: return False`，调用方随即 continue 丢掉该帧
+    # （一帧 = 8ms 音频凭空消失）。实测 45 秒内丢了 100 帧，且成串爆发（1 秒内连丢 9 帧
+    # = 72ms 空洞 → 明显断音）：根因是锚点与当前帧位置错位后，后续多帧都被判为迟到。
+    # 改成重锚点后，时序照样被校正（延迟不会累积），但**一帧都不会丢**。
+    _REANCHOR_MIN_INTERVAL: float = 0.5
+
+    def _reanchor(self, rtp_timestamp: int, now: float) -> bool:
+        """把锚点重设到当前帧。调用方必须已持有 self._lock。返回是否真的重锚了。"""
+        if now - self._last_reanchor_perf < self._REANCHOR_MIN_INTERVAL:
+            return False
+        self._anchor_rtp_ts = rtp_timestamp
+        self._anchor_perf = now + self._target_latency_sec
+        self._last_reanchor_perf = now
+        self._reanchor_count += 1
+        return True
+
     def wait_for_frame(self, rtp_timestamp: int) -> bool:
         """解码线程调用。等到帧应该释放的时刻。
-        返回 True = 播放，False = 太晚了跳过。
+
+        返回值保留原语义（True = 播放，False = 跳过），但 [本地补丁] 之后本方法
+        **永不返回 False**：迟到只做时序校正，不再丢弃音频。
         """
         if rtp_timestamp == 0:
             return True  # 静音帧直接播放
@@ -201,10 +226,26 @@ class PlaybackPacer:
         if wait_time > 0.005:  # 超过 5ms 才 sleep
             time.sleep(wait_time)
             return True
-        elif wait_time < -0.100:  # 超过 100ms 过期
-            return False  # 跳过
-        else:
-            return True  # 稍微迟到但可接受
+
+        if wait_time < -0.100:  # 超过 100ms 过期
+            # [本地补丁] 原为 return False（丢帧）；改为重锚点后照常播出
+            with self._lock:
+                reanchored = self._reanchor(rtp_timestamp, now)
+                count = self._reanchor_count
+                since_anchor = (
+                    now - self._last_anchor_update_perf
+                    if self._last_anchor_update_perf > 0
+                    else -1.0
+                )
+            if reanchored and (count <= 10 or count % 50 == 0):
+                log.warning(
+                    f"[卡顿诊断] Pacer 迟到 {abs(wait_time) * 1000:.0f}ms → 已改为重锚点"
+                    f"（不再丢帧）；距上次 D4 锚点 {since_anchor * 1000:.0f}ms，"
+                    f"累计重锚 {count} 次"
+                )
+            return True
+
+        return True  # 稍微迟到但可接受
 
     def reset(self) -> None:
         """FLUSH 时重置。"""
@@ -213,6 +254,8 @@ class PlaybackPacer:
             self._anchor_perf = 0.0
             self._drift_rate = 1.0
             self._startup_count = 0
+            # [本地补丁] 允许 FLUSH 后立刻重锚（计数保留，用于统计）
+            self._last_reanchor_perf = 0.0
             self._started = False
 
 
@@ -505,6 +548,9 @@ class AirPlayServer:
 
     def _handle_rtsp_client(self, sock: socket.socket, addr: tuple):
         """处理 RTSP 客户端连接"""
+        # [本地补丁] 起播延迟计时从这里开始
+        _timing.begin(f"AirPlay 会话 {addr[0]}")
+        _timing.mark("RTSP 连接建立")
         log.info(f"AirPlay 客户端连接: {addr}")
         self._rtsp_client_addr = addr  # 存储客户端地址供 SETUP 解析端口使用
         session_active = False
@@ -949,6 +995,7 @@ class AirPlayServer:
             # 预计算单帧静音数据 (352 samples * ch * 2 bytes)，避免循环中反复分配
             self._silence_frame = b'\x00' * (self._sample_rate * self._channels * 2 * 352 // self._sample_rate)
             log.info(f"音频解码器初始化: fmt={self._audio_format}, sr={self._sample_rate}, ch={self._channels}, bits={bitdepth}")
+            _timing.mark("FairPlay+SDP 解析完成、解码器就绪")
         except Exception as e:
             log.error(f"解码器初始化失败: {e}")
             import traceback
@@ -1038,6 +1085,7 @@ class AirPlayServer:
         )
 
         log.info(f"SETUP 响应: server_port={server_port}, control_port={control_port}, timing_port={timing_port}")
+        _timing.mark("SETUP 完成（UDP 通道就绪）")
 
         self._send_rtsp_response(sock, 200, cseq, {
             "Transport": transport_response,
@@ -1250,6 +1298,7 @@ class AirPlayServer:
             return
 
         log.info("RTP: 开始接收音频数据")
+        _timing.mark("首个 RTP 包到达（iPhone 开始发音频）")
 
         # 预计算常用值
         _session_key = self._session_key
@@ -1266,6 +1315,7 @@ class AirPlayServer:
         # ---- Stage 2: 解码线程（带 pacer 调度） ----
         def _decoder_worker():
             _pacer = self._timing_pacer
+            _skip_count = 0  # [本地补丁] 卡顿诊断：Pacer 迟到跳帧计数
             try:
                 while running:
                     try:
@@ -1278,6 +1328,14 @@ class AirPlayServer:
                     # 时间调度: 等到正确时刻再释放帧
                     if _pacer and item.timestamp > 0:
                         if not _pacer.wait_for_frame(item.timestamp):
+                            # [本地补丁] 卡顿诊断：迟到跳帧原本完全静默，而每跳一帧
+                            # 就是一次可听见的断音。前 10 次全记，之后每 50 次记一条。
+                            _skip_count += 1
+                            if _skip_count <= 10 or _skip_count % 50 == 0:
+                                log.warning(
+                                    f"[卡顿诊断] Pacer 跳帧 seq={item.seq}"
+                                    f"（迟到丢弃），累计 {_skip_count} 次"
+                                )
                             continue  # 太晚了，跳过
 
                     # 静音帧直接写入
@@ -1323,6 +1381,7 @@ class AirPlayServer:
 
             # 重传状态: seq -> (首次请求 perf_counter 时间, 重试次数)
             _retransmit_state: dict[int, tuple[float, int]] = {}
+            _giveup_count = 0  # [本地补丁] 卡顿诊断：重传放弃并插静音的累计次数
             _RETRANSMIT_BASE_INTERVAL = 0.040  # 40ms
             _RETRANSMIT_MAX_INTERVAL = 1.000
             _RETRANSMIT_GIVE_UP_TIME = 2.0  # 2秒后放弃
@@ -1357,6 +1416,7 @@ class AirPlayServer:
                             if len(jb) < STARTUP_BUFFER_TARGET * 2:
                                 continue
                         startup_buffered = True
+                        _timing.mark("MiAir 起播缓冲满足（开始向音箱送 PCM）")
 
                     # 检查 FLUSH 请求
                     if self._flush_flag.is_set():
@@ -1395,6 +1455,15 @@ class AirPlayServer:
                                     if next_avail is not None:
                                         gap = (next_avail - missing_seq) & 0xFFFF
                                         gap = min(gap, 64)
+                                        # [本地补丁] 卡顿诊断：放弃重传会插入静音帧，
+                                        # 原本完全静默、日志里查不到。
+                                        _giveup_count += 1
+                                        if _giveup_count <= 10 or _giveup_count % 50 == 0:
+                                            log.warning(
+                                                f"[卡顿诊断] 重传放弃 seq={missing_seq}，"
+                                                f"插入静音 {gap} 帧（≈{gap * 8}ms），"
+                                                f"累计 {_giveup_count} 次"
+                                            )
                                         for _ in range(gap):
                                             try:
                                                 decode_queue.put_nowait(
